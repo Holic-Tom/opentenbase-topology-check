@@ -1,11 +1,12 @@
 """Check the OpenTenBase node catalog through a coordinator."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -22,7 +23,7 @@ FROM pg_catalog.pgxc_node
 
 ROLE_NAMES = {"C": "coordinator", "D": "data_node", "G": "gtm"}
 RUNTIME_STATES = ("running", "stopped", "unknown")
-RUNTIME_NODE = re.compile(r"^\s*Node\s+(\S+?)\([^\r\n]+\)\s+is\s+(Running|Stopped|Unknown)\s*$", re.M)
+RUNTIME_NODE = re.compile(r"^\s*Node\s+(\S+?)\(([^\r\n]+)\)\s+is\s+(Running|Stopped|Unknown)\s*$", re.M)
 RUNTIME_TOTALS = re.compile(r"^\s*\[Result\]\s+Total:\s*(\d+),\s*Running:\s*(\d+),\s*Stopped:\s*(\d+),\s*Unknown:\s*(\d+)\s*$", re.M)
 
 
@@ -62,8 +63,12 @@ def summarize_runtime(nodes):
 
 def parse_runtime(output):
     nodes = [
-        {"name": name, "state": state.lower()}
-        for name, state in RUNTIME_NODE.findall(output)
+        {
+            "name": name,
+            "instance_id": hashlib.sha256(address.encode("utf-8")).hexdigest()[:16],
+            "state": state.lower(),
+        }
+        for name, address, state in RUNTIME_NODE.findall(output)
     ]
     totals = RUNTIME_TOTALS.search(output)
     report = summarize_runtime(nodes)
@@ -95,23 +100,93 @@ def read_runtime(config_path):
     return {"status": "error", "error": error}
 
 
-def compare_baseline(report, baseline_path):
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8-sig"))
+def load_snapshot(path):
+    snapshot = json.loads(path.read_text(encoding="utf-8-sig"))
     if (
-        not isinstance(baseline, dict)
-        or baseline.get("source") != report["source"]
-        or baseline.get("status") not in ("ok", "warning")
+        not isinstance(snapshot, dict)
+        or snapshot.get("source") not in ("live", "demo")
+        or snapshot.get("status") not in ("ok", "warning")
     ):
-        raise ValueError("Baseline must be a successful report from the same mode")
+        raise ValueError("Expected a successful inspection snapshot")
+    validate_rows(snapshot.get("nodes"))
+    if snapshot.get("runtime") is not None:
+        runtime_states(snapshot["runtime"])
+    return snapshot
 
-    before = {(node["name"], node["type"]) for node in validate_rows(baseline.get("nodes"))}
+
+def runtime_states(runtime):
+    if not isinstance(runtime, dict) or runtime.get("status") not in ("ok", "warning"):
+        raise ValueError("Invalid runtime snapshot")
+    nodes = runtime.get("nodes")
+    if not isinstance(nodes, list) or any(
+        not isinstance(node, dict)
+        or not isinstance(node.get("name"), str)
+        or node.get("state") not in RUNTIME_STATES
+        or ("instance_id" in node and not isinstance(node["instance_id"], str))
+        for node in nodes
+    ):
+        raise ValueError("Invalid runtime nodes")
+    by_name = defaultdict(list)
+    for node in nodes:
+        by_name[node["name"]].append(node)
+    for instances in by_name.values():
+        ids = [node["instance_id"] for node in instances if "instance_id" in node]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate runtime instance identifier")
+    return by_name
+
+
+def compare_runtime(previous, current):
+    before = runtime_states(previous)
+    after = runtime_states(current)
+    result = {"changed": [], "ambiguous_names": []}
+    for name in sorted(before.keys() & after.keys()):
+        old_nodes, new_nodes = before[name], after[name]
+        if all("instance_id" in node for node in old_nodes + new_nodes):
+            old_by_id = {node["instance_id"]: node for node in old_nodes}
+            new_by_id = {node["instance_id"]: node for node in new_nodes}
+            pairs = [(old_by_id[key], new_by_id[key]) for key in sorted(old_by_id.keys() & new_by_id.keys())]
+        elif len(old_nodes) == len(new_nodes) == 1:
+            pairs = [(old_nodes[0], new_nodes[0])]
+        else:
+            result["ambiguous_names"].append(name)
+            continue
+
+        for old, new in pairs:
+            if old["state"] != new["state"]:
+                change = {"name": name, "before": old["state"], "after": new["state"]}
+                if "instance_id" in new:
+                    change["instance_id"] = new["instance_id"]
+                result["changed"].append(change)
+    return result
+
+
+def compare_baseline(report, baseline_path):
+    baseline = load_snapshot(baseline_path)
+    if baseline["source"] != report["source"]:
+        raise ValueError("Baseline and current report use different sources")
+    before = {(node["name"], node["type"]) for node in baseline["nodes"]}
     after = {(node["name"], node["type"]) for node in report["nodes"]}
     report["topology_changes"] = {
         "added": [{"name": name, "type": code} for name, code in sorted(after - before)],
         "removed": [{"name": name, "type": code} for name, code in sorted(before - after)],
     }
-    if before != after:
+    runtime = report.get("runtime")
+    runtime_delta = {"changed": [], "ambiguous_names": []}
+    if baseline.get("runtime") and runtime and runtime["status"] != "error":
+        runtime_delta = compare_runtime(baseline["runtime"], runtime)
+        report["runtime_changes"] = runtime_delta
+    if report["status"] == "ok" and (before != after or any(runtime_delta.values())):
         report["status"] = "warning"
+
+
+def replay_snapshot(path):
+    saved = load_snapshot(path)
+    report = summarize(saved["nodes"], saved["source"])
+    report["replayed"] = True
+    if saved.get("runtime"):
+        add_runtime(report, summarize_runtime(saved["runtime"]["nodes"]))
+    return report
 
 
 def summarize(rows, source):
@@ -151,14 +226,27 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true", help="Read the configured database.")
     mode.add_argument("--demo", choices=("normal", "missing-data-node", "stopped-node", "unknown-node"))
+    mode.add_argument("--snapshot", type=Path, help="Read a saved inspection without contacting a database.")
     parser.add_argument("--baseline", type=Path, help="Compare against an earlier JSON report.")
     parser.add_argument("--status-config", type=Path, help="OpenTenBase V5 config for the native status check.")
     args = parser.parse_args()
-    if args.demo and args.status_config:
+    if not args.live and args.status_config:
         parser.error("--status-config requires --live")
 
     if args.demo:
-        report = summarize(demo_rows(args.demo), "demo")
+        rows = demo_rows(args.demo)
+        report = summarize(rows, "demo")
+        affected = {"stopped-node": "stopped", "unknown-node": "unknown"}
+        runtime_nodes = [
+            {"name": node["name"], "state": affected.get(args.demo, "running") if node["type"] == "D" else "running"}
+            for node in rows
+        ]
+        add_runtime(report, summarize_runtime(runtime_nodes))
+    elif args.snapshot:
+        try:
+            report = replay_snapshot(args.snapshot)
+        except (OSError, ValueError):
+            report = {"source": "snapshot", "replayed": True, "status": "error", "error": "invalid_snapshot"}
     else:
         try:
             report = summarize(read_topology(), "live")
@@ -171,22 +259,14 @@ def main():
             fallback = "invalid_output" if isinstance(error, ValueError) else "psql_launch_failed"
             code = error_codes.get(type(error), fallback)
             report = {"source": "live", "status": "error", "error": code}
+        if args.status_config:
+            add_runtime(report, read_runtime(args.status_config))
 
-    if args.baseline and report["status"] != "error":
+    if args.baseline and "nodes" in report:
         try:
             compare_baseline(report, args.baseline)
         except (OSError, ValueError):
             report.update(status="error", error="invalid_baseline")
-
-    if args.demo:
-        affected = {"stopped-node": "stopped", "unknown-node": "unknown"}
-        runtime_nodes = [
-            {"name": node["name"], "state": affected.get(args.demo, "running") if node["type"] == "D" else "running"}
-            for node in report["nodes"]
-        ]
-        add_runtime(report, summarize_runtime(runtime_nodes))
-    elif args.status_config:
-        add_runtime(report, read_runtime(args.status_config))
 
     print(json.dumps(report, indent=2))
     return {"ok": 0, "warning": 1, "error": 3}[report["status"]]

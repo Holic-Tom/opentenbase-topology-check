@@ -126,16 +126,92 @@ class TopologyCheckTest(unittest.TestCase):
     def test_runtime_parser_keeps_distinct_instances(self):
         report = check_topology.parse_runtime(STATUS_OUTPUT)
         self.assertEqual(report["state_counts"], {"running": 1, "stopped": 1, "unknown": 1})
-        self.assertEqual(report["nodes"][1:], [
+        primary, secondary = report["nodes"][1:]
+        self.assertEqual((primary["name"], primary["state"]), ("dn0001", "stopped"))
+        self.assertEqual((secondary["name"], secondary["state"]), ("dn0001", "unknown"))
+        self.assertNotEqual(primary["instance_id"], secondary["instance_id"])
+        self.assertNotIn("192.0.2.1", json.dumps(report))
+
+    def test_runtime_comparison_matches_same_named_instances_by_id(self):
+        previous = check_topology.parse_runtime(STATUS_OUTPUT)
+        current = check_topology.parse_runtime(STATUS_OUTPUT.replace("is Stopped", "is Running")
+                                                .replace("Running: 1, Stopped: 1", "Running: 2, Stopped: 0"))
+        current["nodes"].reverse()
+        result = check_topology.compare_runtime(previous, current)
+        self.assertEqual(result, {
+            "changed": [{
+                "name": "dn0001", "instance_id": previous["nodes"][1]["instance_id"],
+                "before": "stopped", "after": "running",
+            }],
+            "ambiguous_names": [],
+        })
+
+    def test_older_snapshot_supports_single_names_and_flags_ambiguous_names(self):
+        current = check_topology.parse_runtime(STATUS_OUTPUT)
+        older = {"status": "warning", "nodes": [
+            {"name": "cn0001", "state": "unknown"},
+            {"name": "dn0001", "state": "running"},
             {"name": "dn0001", "state": "stopped"},
-            {"name": "dn0001", "state": "unknown"},
-        ])
+        ]}
+        result = check_topology.compare_runtime(older, current)
+        self.assertEqual(result["ambiguous_names"], ["dn0001"])
+        self.assertEqual(result["changed"][0]["name"], "cn0001")
+        self.assertEqual(result["changed"][0]["before"], "unknown")
+
+    def test_replay_reports_stop_and_recovery_without_reading_database(self):
+        _, normal = self.run_demo("normal")
+        _, stopped = self.run_demo("stopped-node")
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory, "initial.json")
+            second = Path(directory, "stopped.json")
+            first.write_text(json.dumps(normal), encoding="utf-8")
+            second.write_text(json.dumps(stopped), encoding="utf-8")
+            for earlier, later, before, after in (
+                (first, second, "running", "stopped"),
+                (second, first, "stopped", "running"),
+            ):
+                with (
+                    self.subTest(before=before, after=after),
+                    patch.object(sys, "argv", [str(SCRIPT), "--snapshot", str(later), "--baseline", str(earlier)]),
+                    patch.object(subprocess, "run", side_effect=AssertionError("unexpected native command")),
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    self.assertEqual(check_topology.main(), 1)
+                    result = json.loads(output.getvalue())
+                    self.assertTrue(result["replayed"])
+                    self.assertEqual(result["topology_changes"], {"added": [], "removed": []})
+                    self.assertEqual(result["runtime_changes"]["changed"], [{
+                        "name": "dn_demo", "before": before, "after": after,
+                    }])
 
     def test_runtime_parser_rejects_partial_output(self):
         for output in ("", STATUS_OUTPUT.replace("Total: 3", "Total: 4")):
             with self.subTest(output=output):
                 with self.assertRaises(ValueError):
                     check_topology.parse_runtime(output)
+
+    def test_replay_recorded_lab_snapshots(self):
+        examples = SCRIPT.parents[1] / "examples"
+        for previous, current, before, after, running in (
+            ("01-running", "02-stopped", "running", "stopped", 3),
+            ("02-stopped", "03-recovered", "stopped", "running", 4),
+        ):
+            with self.subTest(current=current):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--snapshot", str(examples / (current + ".json")),
+                     "--baseline", str(examples / (previous + ".json"))],
+                    capture_output=True, text=True, timeout=5,
+                )
+                report = json.loads(result.stdout)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(report["source"], "live")
+                self.assertTrue(report["replayed"])
+                self.assertEqual(report["role_counts"]["data_node"], 2)
+                self.assertEqual(report["runtime"]["state_counts"]["running"], running)
+                self.assertEqual(report["topology_changes"], {"added": [], "removed": []})
+                self.assertEqual(report["runtime_changes"]["changed"], [{
+                    "name": "dn0001", "instance_id": "lab-dn0001", "before": before, "after": after,
+                }])
 
     def test_live_runtime_invokes_read_only_status_subcommand(self):
         with tempfile.TemporaryDirectory() as directory:

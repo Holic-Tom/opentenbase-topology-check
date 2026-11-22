@@ -1,6 +1,6 @@
 # OpenTenBase 节点巡检 Skill
 
-一次巡检可以通过 `psql` 读取系统目录 `pgxc_node`、通过 `opentenbase_ctl status` 查询实际运行状态，并与上次的 JSON 快照比较登记节点。Agent 读取统一的 JSON 后生成摘要。一个节点即使已停止，也可能仍登记在数据库中。
+一次巡检可以通过 `psql` 读取系统目录 `pgxc_node`、通过 `opentenbase_ctl status` 查询实际运行状态，并与上次的 JSON 快照比较登记节点及实例状态。一个数据节点即使仍在登记名单里，报告也能指出它从运行变为停止，或从停止恢复运行。
 
 ## 本地演示
 
@@ -24,7 +24,18 @@ python scripts/check_topology.py --demo normal | Set-Content -Encoding UTF8 -Lit
 python scripts/check_topology.py --demo missing-data-node --baseline $baseline
 ```
 
-真实环境用 `--live` 生成和对比快照，须使用同一集群。比较使用节点名和类型，角色变化会显示为旧条目移除、新条目新增。
+真实环境用 `--live` 生成快照。对比须使用同一集群的两份快照。登记节点按名称和类型比较，角色变化表现为一条移除和一条新增。运行状态按名称和实例标识配对。实例标识由原生工具返回的地址和端口生成，JSON 中省略原始地址。旧快照缺少实例标识时，可以比较两边都唯一的节点名；无法配对的同名实例会在 `runtime_changes.ambiguous_names` 中提示。
+
+## 离线回放真实快照
+
+仓库提供独立实验集群的三份记录。测试时仅停止并恢复 `dn0001`，三次采集的登记名单一致。样本用统一的代号替换了实例标识。
+
+```powershell
+python scripts/check_topology.py --snapshot examples/02-stopped.json --baseline examples/01-running.json
+python scripts/check_topology.py --snapshot examples/03-recovered.json --baseline examples/02-stopped.json
+```
+
+第一条命令报告 `running → stopped`，第二条报告 `stopped → running`。两次输出都有 `replayed: true`，其中 `source: live` 表示快照最初采自真实集群。回放只读取本地 JSON。
 
 ## 连接 OpenTenBase
 
@@ -46,7 +57,7 @@ python scripts/check_topology.py --live
 python3 scripts/check_topology.py --live --status-config /path/to/opentenbase_config.ini
 ```
 
-脚本从配置所在目录运行固定的 `opentenbase_ctl status -c`，并把每个运行实例的状态写到 `runtime.nodes`。有主备配置时，同名节点可能显示多条运行实例。真实快照对比可以同时传入 `--baseline`，比较的是登记节点。
+脚本从配置所在目录运行固定的 `opentenbase_ctl status -c`，并把每个运行实例的状态写到 `runtime.nodes`。有主备配置时，同名节点可能显示多条运行实例。传入 `--baseline` 后，`topology_changes` 报告登记节点的增减。两次巡检都采集了运行状态时，`runtime_changes.changed` 报告配对实例的前后状态。
 
 ## 在 Agent 中调用
 
@@ -55,6 +66,8 @@ python3 scripts/check_topology.py --live --status-config /path/to/opentenbase_co
 导入后可以输入「请用 OpenTenBase 节点巡检 Skill 模拟巡检，演示一个仍在名单里但已停机的数据节点」。预期调用 `python scripts/check_topology.py --demo stopped-node`，并根据 JSON 报告 `dn_demo` 仍在登记名单中，模拟状态为已停止。真实巡检时，在 Agent 的执行环境中配置数据库连接和运维工具，并提供已有集群配置文件的路径。
 
 如果手头的工具只支持聊天，在终端运行上述 Python 命令，再把输出贴给它解读即可。客户端安装验证及自然语言调用的复验状态见 [DEMO.md](DEMO.md)。
+
+Claude Code 已验证从普通自然语言选择 Skill、执行模拟脚本并解释结果。该客户端从项目的 `.claude/skills/` 加载技能包。 [调用记录和回放](DEMO.md#agent-自然语言调用) · [Claude Code 安装说明](https://code.claude.com/docs/en/skills)
 
 ### 在 Codex 中调用
 
@@ -78,7 +91,7 @@ codex
 | 退出码 | 含义 |
 | --- | --- |
 | 0 | 已请求的检查均完成，未发现告警 |
-| 1 | 登记中缺少协调节点或数据节点、检测到节点变更，或存在停止或状态未知的实例 |
+| 1 | 登记中缺少协调节点或数据节点、检测到登记或运行状态变化，或存在停止、状态未知或无法配对的同名实例 |
 | 2 | 命令行参数使用错误 |
 | 3 | 查询无法完成或结果格式异常，详见 JSON 中的 `error` |
 

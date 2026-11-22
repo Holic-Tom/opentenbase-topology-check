@@ -1,0 +1,79 @@
+{
+  "source": "live",
+  "status": "warning",
+  "coordinator_query": "succeeded",
+  "role_counts": {
+    "coordinator": 1,
+    "data_node": 2,
+    "gtm": 1,
+    "unknown": 0
+  },
+  "missing_catalog_roles": [],
+  "nodes": [
+    {
+      "name": "cn0001",
+      "type": "C",
+      "role": "coordinator"
+    },
+    {
+      "name": "dn0001",
+      "type": "D",
+      "role": "data_node"
+    },
+    {
+      "name": "dn0002",
+      "type": "D",
+      "role": "data_node"
+    },
+    {
+      "name": "gtm0001",
+      "type": "G",
+      "role": "gtm"
+    }
+  ],
+  "runtime": {
+    "status": "warning",
+    "state_counts": {
+      "running": 3,
+      "stopped": 1,
+      "unknown": 0
+    },
+    "nodes": [
+      {
+        "name": "dn0001",
+        "instance_id": "lab-dn0001",
+        "state": "stopped"
+      },
+      {
+        "name": "cn0001",
+        "instance_id": "lab-cn0001",
+        "state": "running"
+      },
+      {
+        "name": "gtm0001",
+        "instance_id": "lab-gtm0001",
+        "state": "running"
+      },
+      {
+        "name": "dn0002",
+        "instance_id": "lab-dn0002",
+        "state": "running"
+      }
+    ]
+  },
+  "topology_changes": {
+    "added": [],
+    "removed": []
+  },
+  "runtime_changes": {
+    "changed": [
+      {
+        "name": "dn0001",
+        "before": "running",
+        "after": "stopped",
+        "instance_id": "lab-dn0001"
+      }
+    ],
+    "ambiguous_names": []
+  }
+}
