@@ -48,7 +48,15 @@ python3 scripts/check_topology.py --live --status-config /path/to/opentenbase_co
 
 脚本从配置所在目录运行固定的 `opentenbase_ctl status -c`，并把每个运行实例的状态写到 `runtime.nodes`。有主备配置时，同名节点可能显示多条运行实例。真实快照对比可以同时传入 `--baseline`，比较的是登记节点。
 
-## 在 Codex 中调用
+## 在 Agent 中调用
+
+技能包采用 [Agent Skills 规范](https://agentskills.io/specification)。如果你的客户端支持这一规范并允许执行本地命令，可按该客户端的说明导入整个 `opentenbase-topology-check` 文件夹。保留 [SKILL.md](SKILL.md) 和 `scripts/` 的相对位置。
+
+导入后可以输入「请用 OpenTenBase 节点巡检 Skill 模拟巡检，演示一个仍在名单里但已停机的数据节点」。预期调用 `python scripts/check_topology.py --demo stopped-node`，并根据 JSON 报告 `dn_demo` 仍在登记名单中，模拟状态为已停止。真实巡检时，在 Agent 的执行环境中配置数据库连接和运维工具，并提供已有集群配置文件的路径。
+
+如果手头的工具只支持聊天，在终端运行上述 Python 命令，再把输出贴给它解读即可。客户端安装验证及自然语言调用的复验状态见 [DEMO.md](DEMO.md)。
+
+### 在 Codex 中调用
 
 在解压后含有 `opentenbase-topology-check` 文件夹的目录打开 PowerShell。把整个 Skill 文件夹复制到新演示项目的 `.agents/skills/` 后启动 Codex。
 
@@ -61,7 +69,7 @@ Set-Location -LiteralPath $project
 codex
 ```
 
-在 Codex 中输入「请用 $opentenbase-topology-check 模拟巡检 OpenTenBase，演示一个仍在名单里但已停机的数据节点」。检查是否调用 `scripts/check_topology.py --demo stopped-node`，以及回答是否把数据来源标为模拟。真实巡检时提供已有运维配置路径，并在启动 Codex 的终端预先配置数据库连接。
+在 Codex 中输入上面的模拟巡检请求，也可以用 `$opentenbase-topology-check` 明确指定这个 Skill。
 
 [Codex Skill 安装说明](https://learn.chatgpt.com/docs/build-skills)
 
